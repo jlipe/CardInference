@@ -20,7 +20,8 @@ let package = Package(
         .target(
             name: "CardInference",
             resources: [
-                .process("Resources/SuitImageClassifier.mlmodel")
+                .process("Resources/SuitImageClassifier.mlmodel"),
+                .process("Resources/RankClassifier.mlmodel")
             ]),
         .testTarget(
             name: "CardInferenceTests",

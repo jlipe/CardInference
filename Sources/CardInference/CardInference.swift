@@ -6,10 +6,11 @@ import CoreML
 @available(iOS 17.0, *)
 public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, ObservableObject, @unchecked Sendable {
     private var captureSession: AVCaptureSession?
-    private var visionModel: VNCoreMLModel?
+    private var suitModel: VNCoreMLModel?
+    private var rankModel: VNCoreMLModel?
     private let serialQueue = DispatchQueue(label: "com.cardinference.serialQueue")
     
-    public var inferenceCallback: ((String, Float) -> Void)?
+    public var inferenceCallback: ((String, Float, String, Float) -> Void)?
     
     public override init() {
         super.init()
@@ -40,39 +41,67 @@ public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     }
     
     private func setupVision() {
-        guard let modelURL = Bundle.module.url(forResource: "SuitImageClassifier", withExtension: "mlmodelc"),
-              let model = try? MLModel(contentsOf: modelURL),
-              let visionModel = try? VNCoreMLModel(for: model) else {
-            print("Failed to load Core ML model")
+        guard let suitModelURL = Bundle.module.url(forResource: "SuitImageClassifier", withExtension: "mlmodelc"),
+              let suitModel = try? MLModel(contentsOf: suitModelURL),
+              let suitVisionModel = try? VNCoreMLModel(for: suitModel),
+              let rankModelURL = Bundle.module.url(forResource: "RankClassifier", withExtension: "mlmodelc"),
+              let rankModel = try? MLModel(contentsOf: rankModelURL),
+              let rankVisionModel = try? VNCoreMLModel(for: rankModel) else {
+            print("Failed to load Core ML models")
             return
         }
         
-        self.visionModel = visionModel
+        self.suitModel = suitVisionModel
+        self.rankModel = rankVisionModel
     }
     
     private func performInference(on pixelBuffer: CVPixelBuffer) {
-        guard let visionModel = visionModel else {
-            print("Vision model not set up")
+        guard let suitModel = suitModel, let rankModel = rankModel else {
+            print("Vision models not set up")
             return
         }
         
-        let request = VNCoreMLRequest(model: visionModel) { [weak self] request, error in
+        let suitRequest = VNCoreMLRequest(model: suitModel) { [weak self] request, error in
             guard let results = request.results as? [VNClassificationObservation],
                   let topResult = results.first else { return }
             
-            let identifier = topResult.identifier
-            let confidence = topResult.confidence
+            let suitIdentifier = topResult.identifier
+            let suitConfidence = topResult.confidence
+            
+            self?.performRankInference(on: pixelBuffer, suitIdentifier: suitIdentifier, suitConfidence: suitConfidence)
+        }
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do {
+            try handler.perform([suitRequest])
+        } catch {
+            print("Failed to perform suit inference: \(error)")
+        }
+    }
+    
+    private func performRankInference(on pixelBuffer: CVPixelBuffer, suitIdentifier: String, suitConfidence: Float) {
+        guard let rankModel = rankModel else {
+            print("Rank model not set up")
+            return
+        }
+        
+        let rankRequest = VNCoreMLRequest(model: rankModel) { [weak self] request, error in
+            guard let results = request.results as? [VNClassificationObservation],
+                  let topResult = results.first else { return }
+            
+            let rankIdentifier = topResult.identifier
+            let rankConfidence = topResult.confidence
             
             self?.serialQueue.async { [weak self] in
-                self?.inferenceCallback?(identifier, confidence)
+                self?.inferenceCallback?(suitIdentifier, suitConfidence, rankIdentifier, rankConfidence)
             }
         }
         
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
-            try handler.perform([request])
+            try handler.perform([rankRequest])
         } catch {
-            print("Failed to perform inference: \(error)")
+            print("Failed to perform rank inference: \(error)")
         }
     }
     
