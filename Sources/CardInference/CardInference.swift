@@ -3,6 +3,31 @@ import AVFoundation
 import Vision
 import CoreML
 
+public enum Suit: String, CaseIterable, Sendable {
+    case heart, diamond, club, spade
+}
+
+public enum Rank: String, CaseIterable, Sendable {
+    case ace, two, three, four, five, six, seven, eight, nine, ten, jack, queen, king
+}
+
+public struct CardInferenceResult: Equatable, Sendable {
+    internal let suit: Suit
+    internal let rank: Rank
+    
+    public var suitString: String {
+        return suit.rawValue
+    }
+    
+    public var rankString: String {
+        return rank.rawValue
+    }
+    
+    public var cardString: String {
+        return "\(rankString)\(suitString)"
+    }
+}
+
 @available(iOS 17.0, *)
 public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, ObservableObject, @unchecked Sendable {
     private var captureSession: AVCaptureSession?
@@ -10,7 +35,11 @@ public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private var rankModel: VNCoreMLModel?
     private let serialQueue = DispatchQueue(label: "com.cardinference.serialQueue")
     
-    public var inferenceCallback: ((String, Float, String, Float) -> Void)?
+    public var inferenceCallback: ((CardInferenceResult?) -> Void)?
+    
+    // Confidence thresholds
+    public var suitConfidenceThreshold: Float = 0.99
+    public var rankConfidenceThreshold: Float = 0.95
     
     public override init() {
         super.init()
@@ -29,7 +58,6 @@ public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         
         guard let frontCamera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
               let input = try? AVCaptureDeviceInput(device: frontCamera) else {
-            print("Failed to set up front camera")
             return
         }
         
@@ -55,56 +83,6 @@ public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         self.rankModel = rankVisionModel
     }
     
-    private func performInference(on pixelBuffer: CVPixelBuffer) {
-        guard let suitModel = suitModel, let rankModel = rankModel else {
-            print("Vision models not set up")
-            return
-        }
-        
-        let suitRequest = VNCoreMLRequest(model: suitModel) { [weak self] request, error in
-            guard let results = request.results as? [VNClassificationObservation],
-                  let topResult = results.first else { return }
-            
-            let suitIdentifier = topResult.identifier
-            let suitConfidence = topResult.confidence
-            
-            self?.performRankInference(on: pixelBuffer, suitIdentifier: suitIdentifier, suitConfidence: suitConfidence)
-        }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do {
-            try handler.perform([suitRequest])
-        } catch {
-            print("Failed to perform suit inference: \(error)")
-        }
-    }
-    
-    private func performRankInference(on pixelBuffer: CVPixelBuffer, suitIdentifier: String, suitConfidence: Float) {
-        guard let rankModel = rankModel else {
-            print("Rank model not set up")
-            return
-        }
-        
-        let rankRequest = VNCoreMLRequest(model: rankModel) { [weak self] request, error in
-            guard let results = request.results as? [VNClassificationObservation],
-                  let topResult = results.first else { return }
-            
-            let rankIdentifier = topResult.identifier
-            let rankConfidence = topResult.confidence
-            
-            self?.serialQueue.async { [weak self] in
-                self?.inferenceCallback?(suitIdentifier, suitConfidence, rankIdentifier, rankConfidence)
-            }
-        }
-        
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do {
-            try handler.perform([rankRequest])
-        } catch {
-            print("Failed to perform rank inference: \(error)")
-        }
-    }
-    
     public func startInference() {
         serialQueue.async { [weak self] in
             self?.captureSession?.startRunning()
@@ -118,7 +96,90 @@ public class CardInference: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     }
     
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            print("Failed to get pixel buffer from sample buffer")
+            return
+        }
         performInference(on: pixelBuffer)
+    }
+    
+    private func performInference(on pixelBuffer: CVPixelBuffer) {
+        guard let suitModel = suitModel, let rankModel = rankModel else {
+            print("Vision models not set up")
+            return
+        }
+        
+        let suitRequest = VNCoreMLRequest(model: suitModel) { [weak self] request, error in
+            if let error = error {
+                print("Suit inference error: \(error.localizedDescription)")
+                self?.inferenceCallback?(nil)
+                return
+            }
+            
+            guard let results = request.results as? [VNClassificationObservation],
+                  let topResult = results.first else {
+                self?.inferenceCallback?(nil)
+                return
+            }
+            
+            guard let suit = Suit(rawValue: topResult.identifier),
+                  topResult.confidence >= self!.suitConfidenceThreshold else {
+                self?.inferenceCallback?(nil)
+                return
+            }
+            
+            self?.performRankInference(on: pixelBuffer, suit: suit)
+        }
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do {
+            try handler.perform([suitRequest])
+        } catch {
+            print("Failed to perform suit inference: \(error)")
+            self.inferenceCallback?(nil)
+        }
+    }
+    
+    private func performRankInference(on pixelBuffer: CVPixelBuffer, suit: Suit) {
+        guard let rankModel = rankModel else {
+            print("Rank model not set up")
+            self.inferenceCallback?(nil)
+            return
+        }
+        
+        let rankRequest = VNCoreMLRequest(model: rankModel) { [weak self] request, error in
+            guard let self = self else { return }
+            if let error = error {
+                print("Rank inference error: \(error.localizedDescription)")
+                self.inferenceCallback?(nil)
+                return
+            }
+            
+            guard let results = request.results as? [VNClassificationObservation],
+                  let topResult = results.first else {
+                self.inferenceCallback?(nil)
+                return
+            }
+            
+            guard let rank = Rank(rawValue: topResult.identifier),
+                  topResult.confidence >= self.rankConfidenceThreshold else {
+                self.inferenceCallback?(nil)
+                return
+            }
+            
+            let result = CardInferenceResult(suit: suit, rank: rank)
+            
+            self.serialQueue.async { [weak self] in
+                self?.inferenceCallback?(result)
+            }
+        }
+        
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
+        do {
+            try handler.perform([rankRequest])
+        } catch {
+            print("Failed to perform rank inference: \(error)")
+            self.inferenceCallback?(nil)
+        }
     }
 }
